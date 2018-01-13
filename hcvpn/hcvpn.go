@@ -26,6 +26,7 @@ type Peer struct {
 	Route  []string `validate:"dive,cidrv4"`
 }
 
+// Config for hcvpn
 type Config struct {
 	TUNName   string
 	Broadcast string
@@ -83,6 +84,7 @@ func NewVpn(ctx context.Context, config Config, cl clog.Logger) (*Vpn, error) {
 	}
 
 	config.Tox.Peers = make(map[string]string)
+	// TODO remove?
 	config.Tox.Supers = make(map[string]string)
 	for _, p := range config.Peers {
 		config.Tox.Peers[p.ToxID] = p.Secret
@@ -138,7 +140,7 @@ func (v *Vpn) Stop() {
 	for _, pc := range v.ip2pc {
 		pc.Close()
 	}
-	<-v.tox.StopAndKill()
+	v.tox.Stop()
 }
 
 func (v *Vpn) getOrCreatePeer(friendId string, friendNumber uint32) *PeerConn {

@@ -6,7 +6,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/keroserene/go-webrtc/data"
+	"github.com/keroserene/go-webrtc"
 )
 
 func chanFromConn(conn net.Conn, bufSize int, log *zap.Logger) chan []byte {
@@ -36,7 +36,7 @@ func chanFromConn(conn net.Conn, bufSize int, log *zap.Logger) chan []byte {
 	return c
 }
 
-func chanFromRtc(channel *data.Channel, log *zap.Logger) chan []byte {
+func chanFromRtc(channel *webrtc.DataChannel, log *zap.Logger) chan []byte {
 	c := make(chan []byte)
 
 	channel.OnOpen = func() {
@@ -54,7 +54,7 @@ func chanFromRtc(channel *data.Channel, log *zap.Logger) chan []byte {
 }
 
 // Pipe creates a full-duplex pipe between the two sockets and transfers data from one to the other.
-func Pipe(ctx context.Context, conn net.Conn, channel *data.Channel, bufSize int, log *zap.Logger) {
+func Pipe(ctx context.Context, conn net.Conn, channel *webrtc.DataChannel, bufSize int, log *zap.Logger) {
 	cc := chanFromConn(conn, bufSize, log)
 	cr := chanFromRtc(channel, log)
 
@@ -77,10 +77,10 @@ func Pipe(ctx context.Context, conn net.Conn, channel *data.Channel, bufSize int
 				return
 			} else {
 				switch channel.ReadyState() {
-				case data.DataStateConnecting:
+				case webrtc.DataStateConnecting:
 					sendQueue = append(sendQueue, b)
 
-				case data.DataStateOpen:
+				case webrtc.DataStateOpen:
 					if len(sendQueue) != 0 {
 						for _, msg := range sendQueue {
 							channel.Send(msg)

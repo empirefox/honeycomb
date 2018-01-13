@@ -9,7 +9,7 @@ import (
 
 	"github.com/empirefox/cement/clog"
 	"github.com/empirefox/honeycomb/hcrtc"
-	"github.com/keroserene/go-webrtc/data"
+	"github.com/keroserene/go-webrtc"
 	"github.com/vishvananda/netlink"
 	"go.uber.org/zap"
 )
@@ -183,7 +183,7 @@ func (pc *PeerConn) connectorrouting(ctx context.Context) {
 	}
 }
 
-func (pc *PeerConn) channelrouting(ctx context.Context, channel *data.Channel, closed chan<- struct{}) {
+func (pc *PeerConn) channelrouting(ctx context.Context, channel *webrtc.DataChannel, closed chan<- struct{}) {
 	defer func() {
 		if closed != nil {
 			closed <- struct{}{}
@@ -215,10 +215,10 @@ func (pc *PeerConn) channelrouting(ctx context.Context, channel *data.Channel, c
 		select {
 		case b := <-pc.out:
 			switch channel.ReadyState() {
-			case data.DataStateConnecting:
+			case webrtc.DataStateConnecting:
 				sendQueue = append(sendQueue, b)
 
-			case data.DataStateOpen:
+			case webrtc.DataStateOpen:
 				if len(sendQueue) != 0 {
 					for _, msg := range sendQueue {
 						channel.Send(msg)
@@ -256,7 +256,7 @@ func (pc *PeerConn) OnSignalingMessageFunc(fn func(msg []byte)) {
 	pc.onSignalingMessage = fn
 }
 
-func (pc *PeerConn) OnIncome(channel *data.Channel) {
+func (pc *PeerConn) OnIncome(channel *webrtc.DataChannel) {
 	pc.wg.Add(1)
 	go pc.channelrouting(context.Background(), channel, nil)
 }

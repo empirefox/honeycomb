@@ -1,7 +1,7 @@
 package hcvpn
 
 import (
-	"golang.org/x/net/ipv4"
+	//	"golang.org/x/net/ipv4"
 
 	"go.uber.org/zap"
 
@@ -11,10 +11,11 @@ import (
 
 const (
 	// MTU used for tunneled packets
-	MTU = 1300
+	MTU = 1500
 )
 
 // ifaceSetup returns new interface!
+// From https://github.com/kanocz/lcvpn
 func (v *Vpn) ifaceSetup() (*water.Interface, netlink.Link, error) {
 	addr, err := netlink.ParseAddr(v.cidr)
 	if nil != err {
@@ -75,7 +76,8 @@ func (v *Vpn) ifaceReading() {
 		}
 
 		if 4 != packet.IPver() {
-			header, _ := ipv4.ParseHeader(packet)
+			// header, _ := ipv4.ParseHeader(packet)
+			// v.log.Debug("Non IPv4 packet", zap.Stringer("header", header))
 			continue
 		}
 

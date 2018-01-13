@@ -5,7 +5,6 @@ import (
 
 	"github.com/empirefox/cement/clog"
 	"github.com/keroserene/go-webrtc"
-	"github.com/keroserene/go-webrtc/data"
 )
 
 const (
@@ -36,7 +35,7 @@ type SignalingServer interface {
 }
 
 type BiChannel interface {
-	OnIncome(channel *data.Channel)
+	OnIncome(channel *webrtc.DataChannel)
 }
 
 type Callback interface {
@@ -88,7 +87,7 @@ func NewConnector(cb Callback, cl clog.Logger) (*RtcConnector, error) {
 
 	// A DataChannel is generated through this callback only when the remote peer
 	// has initiated the creation of the data channel.
-	pc.OnDataChannel = func(channel *data.Channel) { go cb.OnIncome(channel) }
+	pc.OnDataChannel = func(channel *webrtc.DataChannel) { go cb.OnIncome(channel) }
 
 	cb.OnSignalingMessageFunc(r.signalReceive)
 
@@ -197,12 +196,12 @@ func (r *RtcConnector) signalReceive(msg []byte) {
 
 }
 
-func (r *RtcConnector) CreateChannel() (*data.Channel, error) {
+func (r *RtcConnector) CreateChannel() (*webrtc.DataChannel, error) {
 	// Attempting to create the first datachannel triggers ICE.
 	r.log.Debug("Initializing datachannel")
-	dc, err := r.pc.CreateDataChannel("", data.Init{})
+	dc, err := r.pc.CreateDataChannel("")
 	if err != nil {
-		r.log.Error("Unexpected failure creating data.Channel", zap.Error(err))
+		r.log.Error("Unexpected failure creating webrtc.DataChannel", zap.Error(err))
 		return nil, err
 	}
 	r.log.Debug("Initialize datachannel ok ok ok")
