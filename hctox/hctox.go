@@ -1,10 +1,11 @@
 package hctox
 
 import (
+	"encoding/hex"
 	"errors"
-	"io/ioutil"
 	"math/rand"
-	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,19 +17,32 @@ import (
 )
 
 type Callback interface {
-	// Tox completed
 	OnSelfConnectionStatus(status int)
-	OnPeerMessage(friendId string, friendNumber uint32, message []byte)
-	OnSuperMessage(friendId string, friendNumber uint32, message []byte)
-	OnPeerOnline(friendId string, friendNumber uint32)
+	OnActiveAdded(friendId string, friendNumber uint32)
+	OnPassiveAdded(friendId string, friendNumber uint32)
+	OnToxMessage(friendNumber uint32, message []byte)
+	OnToxOnline(friendNumber uint32, on bool)
+}
+
+type Peer struct {
+	Name   string `validate:"required,lte=127"` // TOX_MAX_NAME_LENGTH 128
+	ToxID  string `validate:"len=76"`
+	Secret string `validate:"gte=16,lte=1015"`
 }
 
 type Config struct {
-	NamePrefix   string `default:"HcBot."`
-	ToxsaveFile  string `default:"$HC_HOME/hc.toxsave"`
-	ToxNodesFile string `default:"$HC_HOME/toxnodes.json"`
-	Peers        map[string]string
-	Supers       map[string]string
+	NamePrefix   string `validate:"lte=122" default:"HcBot."` // TOX_MAX_NAME_LENGTH 128
+	ToxSecretKey string `validate:"len=64"`
+	ToxNospam    uint32 `validate:"required"`
+
+	// do not send friend request to list
+	// accept from list
+	// reject others
+	Actives []Peer
+
+	// send friend request to list
+	// only accept from list
+	Passives []Peer
 }
 
 type Tox struct {
@@ -42,28 +56,28 @@ type Tox struct {
 }
 
 func NewTox(config Config, cb Callback, cl clog.Logger) (*Tox, error) {
-	l := cl.Module("TOX")
+	l := cl.Module("hctox")
 	defaults.SetDefaults(&config)
+	if config.Actives == nil {
+		config.Actives = make([]Peer, 0)
+	}
+	if config.Passives == nil {
+		config.Passives = make([]Peer, 0)
+	}
 
-	ns, err := ReadNodes(config.ToxNodesFile, l)
+	opt := tox.NewToxOptions()
+
+	sk, err := hex.DecodeString(strings.ToLower(config.ToxSecretKey))
 	if err != nil {
+		l.Error("ToxSecretKey decode hex", zap.Error(err))
 		return nil, err
 	}
+	opt.Savedata_data = sk
+	opt.Savedata_type = tox.SAVEDATA_TYPE_SECRET_KEY
 
-	toxsaveFile := os.ExpandEnv(config.ToxsaveFile)
-	opt := tox.NewToxOptions()
-	if tox.FileExist(toxsaveFile) {
-		data, err := ioutil.ReadFile(toxsaveFile)
-		if err != nil {
-			l.Error("Read toxsave", zap.Error(err))
-		} else {
-			opt.Savedata_data = data
-			opt.Savedata_type = tox.SAVEDATA_TYPE_TOX_SAVE
-		}
-	}
-
-	r := rand.New(rand.NewSource(99))
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	opt.Tcp_port = 1024 + uint16(r.Intn(64511))
+	l.Debug("Tox tcp", zap.Uint16("port", opt.Tcp_port))
 
 	t := tox.NewTox(opt)
 	if t == nil && opt.Proxy_type != int32(tox.PROXY_TYPE_NONE) {
@@ -87,10 +101,19 @@ func NewTox(config Config, cb Callback, cl clog.Logger) (*Tox, error) {
 		return nil, errors.New("NewTox failed")
 	}
 
-	ns.Bootstrap(t, l)
+	t.SelfSetNospam(config.ToxNospam)
+
+	for _, node := range ToxNodes {
+		ok, err := t.Bootstrap(node.Ipv4, node.Port, node.PublicKey)
+		l.Debug("bootstrap", zap.Error(err), zap.Bool("ok", ok))
+		if node.StatusTcp {
+			ok, err = t.AddTcpRelay(node.Ipv4, node.Port, node.PublicKey)
+			l.Debug("bootstrap tcp", zap.Error(err), zap.Bool("ok", ok))
+		}
+	}
 
 	toxid := t.SelfGetAddress()
-	l.Warn("COPY THIS", zap.String("toxid", toxid))
+	l.Warn("VALIDATE THIS", zap.String("toxid", toxid))
 
 	defaultName := t.SelfGetName()
 	humanName := config.NamePrefix + toxid[0:5]
@@ -99,80 +122,68 @@ func NewTox(config Config, cb Callback, cl clog.Logger) (*Tox, error) {
 	}
 	humanName = t.SelfGetName()
 
-	// do not save
-	//	err = t.WriteSavedata(toxsaveFile)
-	//	if err != nil {
-	//		l.Warn("WriteSavedata", zap.String("file", toxsaveFile), zap.Error(err))
-	//	}
-
-	// add friend
-	fv := t.SelfGetFriendList()
-	for _, fno := range fv {
-		fid, err := t.FriendGetPublicKey(fno)
-		if err != nil {
-			l.Warn("FriendGetPublicKey", zap.Error(err))
-		} else {
-			t.FriendAddNorequest(fid)
-		}
+	activesIds := make(map[string]string)
+	passivesIds := make(map[string]struct{})
+	for _, p := range config.Actives {
+		activesIds[string(p.ToxID[:64])] = p.Secret
 	}
-
-	peers := make(map[string]string)
-	supers := make(map[string]string)
-	for id, secret := range config.Peers {
-		peers[string(id[:64])] = secret
-		t.FriendAddNorequest(id)
-		//		t.FriendAdd(id, secret)
+	for _, p := range config.Passives {
+		passivesIds[string(p.ToxID[:64])] = struct{}{}
 	}
-	for id, secret := range config.Supers {
-		supers[string(id[:64])] = secret
-		t.FriendAddNorequest(id)
-		//		t.FriendAdd(id, secret)
-	}
-	l.Debug("Self info", zap.String("name", humanName), zap.Int("peers", len(peers)), zap.Int("supers", len(supers)))
+	l.Debug("Self info",
+		zap.String("name", humanName),
+		zap.Int("actives", len(activesIds)),
+		zap.Int("passives", len(passivesIds)))
 
+	peers := make(map[uint32]struct{})
+
+	var peerOnce sync.Once
 	// callbacks
 	t.CallbackSelfConnectionStatus(func(t *tox.Tox, status int, userData interface{}) {
-		l.Debug("CallbackSelfConnectionStatus", zap.Int("status", status))
-		go cb.OnSelfConnectionStatus(status)
+		if status != tox.CONNECTION_NONE {
+			peerOnce.Do(func() {
+				for _, p := range config.Passives {
+					num, err := t.FriendAdd(p.ToxID, p.Secret)
+					if err != nil {
+						l.Error("FriendAdd", zap.String("Passive", p.ToxID), zap.Error(err))
+						continue
+					}
+					peers[num] = struct{}{}
+					go cb.OnPassiveAdded(p.ToxID[:64], num)
+				}
+			})
+		}
+		cb.OnSelfConnectionStatus(status)
 	}, nil)
 	t.CallbackFriendRequest(func(t *tox.Tox, friendId string, message string, userData interface{}) {
-		if peers[friendId] != message && supers[friendId] != message {
-			l.Debug("CallbackFriendRequest", zap.String("peer", friendId), zap.Error(err), zap.String("message", message))
+		if _, ok := passivesIds[friendId]; ok {
 			return
 		}
-		num, err := t.FriendAddNorequest(friendId)
-		l.Debug("CallbackFriendRequest", zap.String("peer", friendId), zap.Error(err), zap.Uint32("total", num))
-		//		if num < 100000 {
-		//			t.WriteSavedata(toxsaveFile)
-		//		}
+		if ak, ok := activesIds[friendId]; ok {
+			if message == ak {
+				num, err := t.FriendAddNorequest(friendId)
+				if err != nil {
+					l.Error("FriendAddNorequest", zap.String("Active", friendId), zap.Error(err))
+					return
+				}
+				peers[num] = struct{}{}
+				go cb.OnActiveAdded(friendId, num)
+				return
+			}
+			l.Debug("CallbackFriendRequest reject", zap.String("Active", friendId))
+			return
+		}
+		l.Debug("CallbackFriendRequest ignore unknown", zap.String("peer", friendId))
 	}, nil)
 	t.CallbackFriendMessage(func(t *tox.Tox, friendNumber uint32, message string, userData interface{}) {
-		friendId, err := t.FriendGetPublicKey(friendNumber)
-		if err != nil {
-			l.Warn("CallbackFriendMessage FriendGetPublicKey", zap.Uint32("friendNumber", friendNumber))
+		if _, ok := peers[friendNumber]; ok {
+			go cb.OnToxMessage(friendNumber, []byte(message))
 			return
 		}
-		if _, ok := peers[friendId]; ok {
-			go cb.OnPeerMessage(friendId, friendNumber, []byte(message))
-			return
-		}
-		if _, ok := supers[friendId]; ok {
-			go cb.OnSuperMessage(friendId, friendNumber, []byte(message))
-			return
-		}
-		// cb.OnFriendMessage(friendId, friendNumber, message)
 	}, nil)
 	t.CallbackFriendConnectionStatus(func(t *tox.Tox, friendNumber uint32, status int, userData interface{}) {
-		friendId, err := t.FriendGetPublicKey(friendNumber)
-		if err != nil {
-			l.Warn("CallbackFriendConnectionStatus FriendGetPublicKey", zap.Uint32("friendNumber", friendNumber))
-			return
-		}
-		l.Debug("CallbackFriendConnectionStatus", zap.String("peer", friendId), zap.Int("status", status))
-
-		// online and peer and bigger toxid
-		if _, ok := peers[friendId]; ok && status != tox.CONNECTION_NONE {
-			go cb.OnPeerOnline(friendId, friendNumber)
+		if _, ok := peers[friendNumber]; ok {
+			go cb.OnToxOnline(friendNumber, status != tox.CONNECTION_NONE)
 		}
 	}, nil)
 

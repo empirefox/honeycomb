@@ -169,7 +169,7 @@ func (v *Vpn) getOrCreatePeer(friendId string, friendNumber uint32) *PeerConn {
 // Tox Callback start
 
 func (v *Vpn) OnSelfConnectionStatus(status int) {
-	v.log.Debug("Vpn online")
+	pc.log.Debug("Tox self status", zap.Int("status", status))
 }
 
 func (v *Vpn) OnPeerMessage(friendId string, friendNumber uint32, message []byte) {
@@ -185,9 +185,15 @@ func (v *Vpn) OnSuperMessage(friendId string, friendNumber uint32, message []byt
 	v.log.Warn("Super not implemented", zap.String("friendId", friendId))
 }
 
-func (v *Vpn) OnPeerOnline(friendId string, friendNumber uint32) {
-	v.getOrCreatePeer(friendId, friendNumber)
-	v.log.Debug("peer online", zap.String("friendId", friendId))
+func (v *Vpn) OnPeerOnline(friendId string, friendNumber uint32, on bool) {
+	if on {
+		v.getOrCreatePeer(friendId, friendNumber)
+		v.log.Debug("peer online", zap.String("friendId", friendId))
+	} else {
+		// TODO where and when to recreate pc? Can pc auto negotiation?
+		//		delete(v.tox2pc.Load().(tox2pc), friendNumber)
+		v.log.Debug("peer offline", zap.String("friendId", friendId))
+	}
 }
 
 // Tox Callback end

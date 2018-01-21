@@ -30,12 +30,15 @@ type Nodes struct {
 }
 
 func (ns *Nodes) Bootstrap(t *tox.Tox, l *zap.Logger) {
-	for _, node := range ns.Nodes {
+	for i, node := range ns.Nodes {
 		ok, err := t.Bootstrap(node.Ipv4, node.Port, node.PublicKey)
 		l.Debug("bootstrap", zap.Error(err), zap.Bool("ok", ok))
 		if node.StatusTcp {
 			ok, err = t.AddTcpRelay(node.Ipv4, node.Port, node.PublicKey)
 			l.Debug("bootstrap tcp", zap.Error(err), zap.Bool("ok", ok))
+		}
+		if i == 8 {
+			return
 		}
 	}
 }
