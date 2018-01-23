@@ -65,7 +65,7 @@ func (v *Vpn) ifaceSetup() (*water.Interface, netlink.Link, error) {
 }
 
 // iface writing is in peerconn gorouting
-func (v *Vpn) ifaceReading() {
+func (v *Vpn) IfaceReading() {
 	var packet IPPacket = make([]byte, MTU)
 
 	for {
@@ -83,27 +83,29 @@ func (v *Vpn) ifaceReading() {
 
 		dst := packet.Dst()
 
+		pcs := v.ip2pc.Load().(ip2pc)
+
 		// send ip_data to ip
-		pc, ok := v.ip2pc[dst]
+		pc, ok := pcs[dst]
 		if ok {
-			pc.Write([]byte(packet))
+			pc.c.Write([]byte(packet))
 			continue
 		}
 
 		// Broadcast
 		if dst == v.bcastIP || packet.IsMulticast() {
-			for _, pc := range v.ip2pc {
-				pc.Write([]byte(packet))
+			for _, pc := range pcs {
+				pc.c.Write([]byte(packet))
 			}
 			continue
 		}
 
 		// send net_data to ip
 		dstip := packet.DstV4()
-		for _, pc := range v.ip2pc {
+		for _, pc := range pcs {
 			for _, route := range pc.routes {
 				if route.Dst.Contains(dstip) {
-					pc.Write([]byte(packet))
+					pc.c.Write([]byte(packet))
 					continue
 				}
 			}

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 
@@ -30,10 +29,10 @@ func main() {
 		cl.Fatal("Cannot read config json", zap.String("file", fname), zap.Error(err))
 	}
 
-	c, err := hcvpn.NewVpn(context.Background(), config, cl)
+	c, err := hcvpn.NewVpn(config, cl)
 	if err != nil {
 		return
 	}
-	defer c.Stop()
-	c.Run()
+	defer c.Close()
+	c.IfaceReading()
 }

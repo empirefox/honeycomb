@@ -3,7 +3,6 @@ package hctox
 import (
 	"encoding/hex"
 	"errors"
-	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +13,7 @@ import (
 	"github.com/empirefox/cement/clog"
 	"github.com/kitech/go-toxcore"
 	"github.com/mcuadros/go-defaults"
+	"github.com/phayes/freeport"
 )
 
 type Callback interface {
@@ -75,8 +75,13 @@ func NewTox(config Config, cb Callback, cl clog.Logger) (*Tox, error) {
 	opt.Savedata_data = sk
 	opt.Savedata_type = tox.SAVEDATA_TYPE_SECRET_KEY
 
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	opt.Tcp_port = 1024 + uint16(r.Intn(64511))
+	port, err := freeport.GetFreePort()
+	if err != nil {
+		l.Error("GetFreePort failed", zap.Error(err))
+		return nil, err
+	}
+
+	opt.Tcp_port = uint16(port)
 	l.Debug("Tox tcp", zap.Uint16("port", opt.Tcp_port))
 
 	t := tox.NewTox(opt)
