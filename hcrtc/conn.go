@@ -26,13 +26,12 @@ type Conn struct {
 	recvTmp      []byte
 }
 
-func NewConn(channel *webrtc.DataChannel, local bool, log *zap.Logger) *Conn {
-	label := channel.Label()
+func NewConn(dc *DataChannel, local, remote string, log *zap.Logger) *Conn {
 	c := &Conn{
-		DataChannel: channel,
+		DataChannel: dc.DataChannel,
 		log:         log,
-		localAddr:   newAddr(label),
-		remoteAddr:  newAddr(label),
+		localAddr:   newAddr(local),
+		remoteAddr:  newAddr(remote),
 		recvQueue:   make(chan []byte, 64),
 	}
 
@@ -41,26 +40,21 @@ func NewConn(channel *webrtc.DataChannel, local bool, log *zap.Logger) *Conn {
 	opened := make(chan struct{})
 	// not fired when OnDataChannel
 	c.OnOpen = func() {
-		c.log.Debug("channel.OnOpen", zap.String("label", label))
-		c.recvQueue = make(chan []byte, 64)
-		if local {
-			once.Do(func() { close(opened) })
-		}
+		c.log.Debug("channel.OnOpen", zap.String("remote", remote))
+		once.Do(func() { close(opened) })
 	}
 
 	// TODO not fired when remote disconnect
 	c.OnClose = func() {
-		c.log.Debug("channel.OnClose", zap.String("label", label))
-		close(c.recvQueue)
+		c.log.Debug("channel.OnClose", zap.String("remote", remote))
 	}
 
 	c.OnMessage = func(b []byte) {
 		c.recvQueue <- b
 	}
 
-	if local {
-		<-opened
-	}
+	dc.Done()
+	<-opened
 	return c
 }
 
@@ -133,5 +127,5 @@ type addr struct {
 }
 
 func newAddr(label string) *addr { return &addr{label} }
-func (a *addr) Network() string  { return "webrtc" }
+func (a *addr) Network() string  { return "rtc" }
 func (a *addr) String() string   { return a.label }

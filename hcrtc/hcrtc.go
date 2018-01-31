@@ -3,12 +3,12 @@ package hcrtc
 import (
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/empirefox/cement/clog"
 	"github.com/keroserene/go-webrtc"
 )
 
@@ -42,20 +42,37 @@ type SignalingSender interface {
 	SignalingSend(msg []byte)
 }
 
+type DataChannel struct {
+	*webrtc.DataChannel
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+func NewDataChannel(dc *webrtc.DataChannel) *DataChannel {
+	return &DataChannel{
+		DataChannel: dc,
+		done:        make(chan struct{}),
+	}
+}
+
+func (dc *DataChannel) Done() {
+	dc.doneOnce.Do(func() { close(dc.done) })
+}
+
 type RtcConnector struct {
-	Name string
+	Local  string
+	Remote string
 
 	log      *zap.Logger
 	ss       SignalingSender
 	pc       *webrtc.PeerConnection
-	dcs      chan *webrtc.DataChannel
+	dcs      chan *DataChannel
 	pcfailed atomic.Value
+	addr     net.Addr
 }
 
-func NewConnector(ss SignalingSender, name string, cl clog.Logger) (*RtcConnector, error) {
-	l := cl.Module("hcrtc")
+func NewConnector(local, remote string, ss SignalingSender, log *zap.Logger) (*RtcConnector, error) {
 	webrtc.SetLoggingVerbosity(1)
-	l.Debug("Initiate a WebRTC PeerConnection...")
 
 	config := webrtc.NewConfiguration()
 	var servers []string
@@ -69,16 +86,18 @@ func NewConnector(ss SignalingSender, name string, cl clog.Logger) (*RtcConnecto
 
 	pc, err := webrtc.NewPeerConnection(config)
 	if err != nil {
-		l.Warn("Failed to create PeerConnection", zap.Error(err))
+		log.Warn("Failed to create PeerConnection", zap.Error(err))
 		return nil, err
 	}
 
 	r := &RtcConnector{
-		log:  l,
-		ss:   ss,
-		pc:   pc,
-		Name: name,
-		dcs:  make(chan *webrtc.DataChannel, 16),
+		log:    log,
+		ss:     ss,
+		pc:     pc,
+		Local:  local,
+		Remote: remote,
+		dcs:    make(chan *DataChannel),
+		addr:   newAddr(local),
 	}
 
 	// OnNegotiationNeeded is triggered when something important has occurred in
@@ -92,16 +111,20 @@ func NewConnector(ss SignalingSender, name string, cl clog.Logger) (*RtcConnecto
 
 	// A DataChannel is generated through this callback only when the remote peer
 	// has initiated the creation of the data channel.
-	pc.OnDataChannel = func(channel *webrtc.DataChannel) { r.dcs <- channel }
+	pc.OnDataChannel = func(channel *webrtc.DataChannel) {
+		dc := NewDataChannel(channel)
+		r.dcs <- dc
+		<-dc.done
+	}
 
 	r.pcfailed.Store(false)
 	pc.OnConnectionStateChange = func(state webrtc.PeerConnectionState) {
 		r.pcfailed.Store(state == webrtc.PeerConnectionStateFailed)
-		l.Debug("signal changed", zap.Stringer("state", state))
+		log.Debug("Connection state changed", zap.Stringer("state", state), zap.String("remote", remote))
 	}
 
 	pc.OnSignalingStateChange = func(state webrtc.SignalingState) {
-		l.Debug("signal changed", zap.Stringer("state", state))
+		log.Debug("Signal state changed", zap.Stringer("state", state), zap.String("remote", remote))
 	}
 
 	return r, nil
@@ -200,7 +223,7 @@ func (r *RtcConnector) HandleSignalingMessage(msg []byte) {
 
 }
 
-func (r *RtcConnector) AcceptChannel() (*webrtc.DataChannel, error) {
+func (r *RtcConnector) AcceptChannel() (*DataChannel, error) {
 	for {
 		select {
 		case dc := <-r.dcs:
@@ -215,13 +238,13 @@ func (r *RtcConnector) AcceptChannel() (*webrtc.DataChannel, error) {
 
 func (r *RtcConnector) CreateChannel() (*webrtc.DataChannel, error) {
 	// Attempting to create the first datachannel triggers ICE.
-	r.log.Debug("Initializing datachannel", zap.String("name", r.Name))
-	dc, err := r.pc.CreateDataChannel(r.Name)
+	r.log.Debug("Initializing datachannel", zap.String("remote", r.Remote))
+	dc, err := r.pc.CreateDataChannel(r.Remote)
 	if err != nil {
-		r.log.Error("Unexpected failure creating webrtc.DataChannel", zap.Error(err), zap.String("name", r.Name))
+		r.log.Error("Unexpected failure creating webrtc.DataChannel", zap.Error(err), zap.String("remote", r.Remote))
 		return nil, err
 	}
-	r.log.Debug("Initialize datachannel ok", zap.String("name", r.Name))
+	r.log.Debug("Initialize datachannel ok", zap.String("remote", r.Remote))
 	return dc, nil
 }
 
@@ -229,7 +252,7 @@ func (r *RtcConnector) Accept() (net.Conn, error) {
 	for {
 		select {
 		case dc := <-r.dcs:
-			return NewConn(dc, false, r.log), nil
+			return NewConn(dc, r.Local, r.Remote, r.log), nil
 		case <-time.After(2 * time.Second):
 			if r.pcfailed.Load().(bool) {
 				return nil, ErrPeerConnectionFailed
@@ -243,9 +266,15 @@ func (r *RtcConnector) Dial() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return NewConn(channel, true, r.log), nil
+	dc := NewDataChannel(channel)
+	return NewConn(dc, r.Local, r.Remote, r.log), nil
 }
 
-func (r *RtcConnector) Close() {
-	r.pc.Close()
+func (r *RtcConnector) Close() error {
+	r.pcfailed.Store(true)
+	return r.pc.Close()
+}
+
+func (r *RtcConnector) Addr() net.Addr {
+	return r.addr
 }
