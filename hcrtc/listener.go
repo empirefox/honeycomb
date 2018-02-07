@@ -5,7 +5,6 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 var (
@@ -30,7 +29,6 @@ func NewMergeListener(onfailed func(r *RtcConnector)) *MergeListener {
 		done:     make(chan struct{}),
 	}
 	ml.errOnEmpty.Store(false)
-	ml.closed.Store(false)
 	return ml
 }
 
@@ -41,40 +39,36 @@ func (ml MergeListener) ErrEmpty(e bool) {
 func (ml MergeListener) Add(r *RtcConnector) {
 	atomic.AddInt32(&ml.n, 1)
 	go func() {
+		defer atomic.AddInt32(&ml.n, -1)
 		for {
 			select {
 			case dc := <-r.dcs:
 				ml.resultCh <- NewConn(dc, r.Local, r.Remote, r.log)
-			case <-time.After(2 * time.Second):
-				if !r.pcfailed.Load().(bool) {
-					continue
-				}
+			case <-r.pcfailed:
 				if ml.onfailed != nil {
 					ml.onfailed(r)
 				}
+				return
 			case <-ml.done:
 			}
-			atomic.AddInt32(&ml.n, -1)
-			return
 		}
 	}()
 }
 
 func (ml MergeListener) Accept() (net.Conn, error) {
-	if ml.closed.Load().(bool) {
-		return nil, ErrClosed
-	}
 	if ml.errOnEmpty.Load().(bool) && atomic.LoadInt32(&ml.n) == 0 {
 		return nil, ErrNoConnector
 	}
-	return <-ml.resultCh, nil
+	select {
+	case c := <-ml.resultCh:
+		return c, nil
+	case <-ml.done:
+		return nil, ErrClosed
+	}
 }
 
 func (ml MergeListener) Close() error {
-	ml.closeonce.Do(func() {
-		close(ml.done)
-		ml.closed.Store(true)
-	})
+	ml.closeonce.Do(func() { close(ml.done) })
 	return nil
 }
 

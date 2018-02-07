@@ -28,14 +28,10 @@ type peerConnMap map[uint32]*peerConn
 type peerConn struct {
 	peer         Server
 	friendNumber uint32
-	online       atomic.Value
+	online       bool
+	lastonline   uint64
 	signaling    *peerSignaling
 	connector    *hcrtc.RtcConnector
-}
-
-type addServerCommand struct {
-	pc *peerConn
-	ch chan<- error
 }
 
 type Conductor struct {
@@ -53,20 +49,21 @@ type Conductor struct {
 	selfpk string
 
 	// pkPeerConnMap
-	pk2pc atomic.Value
+	pk2pc pkPeerConnMap
 
 	// peerConnMap
-	client2pc atomic.Value
-	server2pc atomic.Value
+	client2pc peerConnMap
+	server2pc peerConnMap
 
 	running atomic.Value
 
-	addserver []*addServerCommand
-	addpeerMu sync.Mutex
+	mu sync.Mutex
 }
 
 func (v *Conductor) Connector(pk string) (*hcrtc.RtcConnector, bool) {
-	if pc, ok := v.pk2pc.Load().(pkPeerConnMap)[pk]; ok {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if pc, ok := v.pk2pc[pk]; ok {
 		return pc.connector, true
 	}
 	return nil, false
@@ -84,62 +81,73 @@ func (v *Conductor) Run(started chan struct{}) error {
 	v.tox = t
 	v.selfpk = t.SelfGetAddress()[:64]
 
-	v.pk2pc.Store(make(pkPeerConnMap))
-	v.client2pc.Store(make(peerConnMap))
-	v.server2pc.Store(make(peerConnMap))
+	v.pk2pc = make(pkPeerConnMap)
+	v.client2pc = make(peerConnMap)
+	v.server2pc = make(peerConnMap)
+
 	reAddServerTimeout := v.ReAddServerTimeout
 	if reAddServerTimeout == 0 {
-		reAddServerTimeout = 10
+		reAddServerTimeout = 30
 	}
-	var addservernext []*peerConn
 
 	if started != nil {
 		close(started)
 	}
 
+	// TODO need test here
+	resendrequest := true
+
 	v.running.Store(true)
 	for v.running.Load().(bool) {
+		v.mu.Lock()
 		t.Iterate()
 		interval := time.Duration(t.IterationInterval()) * time.Millisecond
 		start := time.Duration(time.Now().UnixNano())
 
+		now := uint64(start / time.Second)
+		// renew client pc
+		for friendNumber, pc := range v.client2pc {
+			select {
+			case <-pc.connector.CloseNotify():
+				v.renewClientPeerConn(friendNumber)
+			default:
+			}
+		}
+
+		// send request for offline timeout servers
+		if resendrequest {
+			for friendNumber, pc := range v.server2pc {
+				select {
+				case <-pc.connector.CloseNotify():
+					v.renewServerPeerConn(friendNumber)
+				default:
+				}
+				if !pc.online {
+					lastonline, err := t.FriendGetLastOnline(friendNumber)
+					if err == nil && now-lastonline > reAddServerTimeout && lastonline != pc.lastonline {
+						// TODO need to be tested
+						v.Log.Debug("ReAddServerTimeout", zap.String("toxid", pc.peer.ToxID), zap.Uint64("lastonline", lastonline))
+						ok, _ := t.FriendDelete(friendNumber)
+						if ok {
+							delete(v.server2pc, friendNumber)
+							v.addServer(pc)
+							pc.lastonline = lastonline
+						}
+					}
+				}
+			}
+		}
+
 		// send message
-		for _, pc := range v.pk2pc.Load().(pkPeerConnMap) {
-			if pc.online.Load().(bool) {
+		for _, pc := range v.pk2pc {
+			if pc.online {
 				for _, msg := range pc.signaling.get() {
 					// msg always non-empty, so no err here
 					t.FriendSendMessage(pc.friendNumber, string(msg))
 				}
 			}
 		}
-
-		// add server
-		v.addpeerMu.Lock()
-		addserver := v.addserver
-		v.addserver = nil
-		v.addpeerMu.Unlock()
-		for _, cmd := range addserver {
-			cmd.ch <- v.addServer(cmd.pc)
-		}
-
-		// send request for offline timeout servers
-		for _, pc := range v.server2pc.Load().(peerConnMap) {
-			if !pc.online.Load().(bool) {
-				lastonline, err := t.FriendGetLastOnline(pc.friendNumber)
-				if err == nil && lastonline > reAddServerTimeout {
-					// TODO need to be tested
-					v.Log.Debug("Server ReAddServerTimeout", zap.String("toxid", pc.peer.ToxID), zap.Uint64("lastonline", lastonline))
-					ok, _ := t.FriendDelete(pc.friendNumber)
-					if ok {
-						v.numFriendRemoved(&v.server2pc, pc.friendNumber)
-						v.addServer(pc)
-					}
-				}
-			}
-		}
-		for _, pc := range addservernext {
-			_ = pc.friendNumber
-		}
+		v.mu.Unlock()
 
 		end := time.Duration(time.Now().UnixNano())
 		time.Sleep(start + interval - end)
@@ -149,9 +157,15 @@ func (v *Conductor) Run(started chan struct{}) error {
 }
 
 func (v *Conductor) Stop() {
-	for _, pc := range v.pk2pc.Load().(pkPeerConnMap) {
+	v.mu.Lock()
+	for _, pc := range v.pk2pc {
 		pc.connector.Close()
+		v.pk2pc = make(pkPeerConnMap)
+		v.client2pc = make(peerConnMap)
+		v.server2pc = make(peerConnMap)
 	}
+	v.mu.Unlock()
+
 	v.running.Store(false)
 }
 
@@ -171,15 +185,12 @@ func (v *Conductor) AddServer(p *Server) (*hcrtc.RtcConnector, error) {
 		signaling: signaling,
 		connector: connector,
 	}
-	pc.online.Store(false)
 
-	ch := make(chan error, 1)
-	v.addpeerMu.Lock()
-	v.addserver = append(v.addserver, &addServerCommand{pc: pc, ch: ch})
-	v.pkFriendAdded(&v.pk2pc, friendId, pc)
-	v.addpeerMu.Unlock()
+	v.mu.Lock()
+	defer v.mu.Unlock()
 
-	err = <-ch
+	v.pk2pc[friendId] = pc
+	err = v.addServer(pc)
 	if err != nil {
 		connector.Close()
 		return nil, err
@@ -194,70 +205,77 @@ func (v *Conductor) addServer(pc *peerConn) error {
 		v.Log.Error("FriendAdd", zap.Error(err))
 		return err
 	}
-	v.numFriendAdded(&v.server2pc, friendNumber, pc)
+	pc.friendNumber = friendNumber
+	v.server2pc[friendNumber] = pc
 	return nil
 }
 
 // loop
-func (v *Conductor) numFriendAdded(target *atomic.Value, friendNumber uint32, pc *peerConn) {
-	pc.friendNumber = friendNumber
-	m1 := target.Load().(peerConnMap)
-	m2 := make(peerConnMap)
-	for k, v := range m1 {
-		m2[k] = v // copy all data from the current object to the new one
+func (v *Conductor) renewClientPeerConn(friendNumber uint32) {
+	pc, ok := v.client2pc[friendNumber]
+	if !ok {
+		return
 	}
-	m2[friendNumber] = pc // do the update that we need
-	target.Store(m2)      // atomically replace the current object with the new one
-}
+	old := pc.connector
 
-// lock
-func (v *Conductor) pkFriendAdded(target *atomic.Value, pk string, pc *peerConn) {
-	m1 := target.Load().(pkPeerConnMap)
-	m2 := make(pkPeerConnMap)
-	for k, v := range m1 {
-		m2[k] = v // copy all data from the current object to the new one
+	signaling := new(peerSignaling)
+	connector, err := hcrtc.NewConnector(v.selfpk, old.Remote, signaling, v.Log)
+	if err != nil {
+		v.Log.Error("NewConnector", zap.Error(err))
+		return
 	}
-	m2[pk] = pc      // do the update that we need
-	target.Store(m2) // atomically replace the current object with the new one
+	pc.signaling = signaling
+	pc.connector = connector
+	if v.OnConnector != nil {
+		v.OnConnector(connector)
+	}
+	old.Close()
 }
 
 // loop
-func (v *Conductor) numFriendRemoved(target *atomic.Value, friendNumber uint32) {
-	m1 := target.Load().(peerConnMap)
-	m2 := make(peerConnMap)
-	for k, v := range m1 {
-		if k != friendNumber {
-			m2[k] = v // copy all data from the current object to the new one
-		}
+func (v *Conductor) renewServerPeerConn(friendNumber uint32) {
+	pc, ok := v.server2pc[friendNumber]
+	if !ok {
+		return
 	}
-	target.Store(m2) // atomically replace the current object with the new one
-}
+	old := pc.connector
 
-// lock
-func (v *Conductor) pkFriendRemoved(target *atomic.Value, pk string) {
-	m1 := target.Load().(pkPeerConnMap)
-	m2 := make(pkPeerConnMap)
-	for k, v := range m1 {
-		if k != pk {
-			m2[k] = v // copy all data from the current object to the new one
-		}
+	signaling := new(peerSignaling)
+	connector, err := hcrtc.NewConnector(v.selfpk, old.Remote, signaling, v.Log)
+	if err != nil {
+		v.Log.Error("NewConnector", zap.Error(err))
+		return
 	}
-	target.Store(m2) // atomically replace the current object with the new one
+	pc.signaling = signaling
+	pc.connector = connector
+	old.Close()
 }
 
 func (v *Conductor) OnSelfConnectionStatus(t *tox.Tox, status int, userData interface{}) {
 	if status != tox.CONNECTION_NONE {
 		v.Log.Debug("OnSelfConnectionStatus online")
+		for friendNumber, pc := range v.client2pc {
+			status, err := t.FriendGetConnectionStatus(friendNumber)
+			if err == nil {
+				pc.online = status != tox.CONNECTION_NONE
+			}
+		}
+		for friendNumber, pc := range v.server2pc {
+			status, err := t.FriendGetConnectionStatus(friendNumber)
+			if err == nil {
+				pc.online = status != tox.CONNECTION_NONE
+			}
+		}
 	} else {
 		v.Log.Debug("OnSelfConnectionStatus offline")
-		for _, pc := range v.pk2pc.Load().(pkPeerConnMap) {
-			pc.online.Store(false)
+		for _, pc := range v.pk2pc {
+			pc.online = false
 		}
 	}
 }
 
 func (v *Conductor) OnFriendRequest(t *tox.Tox, friendId string, message string, userData interface{}) {
-	if _, ok := v.pk2pc.Load().(pkPeerConnMap)[friendId]; ok {
+	if _, ok := v.pk2pc[friendId]; ok {
 		return
 	}
 	if friendId == v.selfpk {
@@ -280,16 +298,13 @@ func (v *Conductor) OnFriendRequest(t *tox.Tox, friendId string, message string,
 	}
 
 	pc := &peerConn{
-		signaling: signaling,
-		connector: connector,
+		friendNumber: friendNumber,
+		signaling:    signaling,
+		connector:    connector,
 	}
-	pc.online.Store(false)
 
-	v.numFriendAdded(&v.client2pc, friendNumber, pc)
-
-	v.addpeerMu.Lock()
-	v.pkFriendAdded(&v.pk2pc, friendId, pc)
-	v.addpeerMu.Unlock()
+	v.client2pc[friendNumber] = pc
+	v.pk2pc[friendId] = pc
 
 	if v.OnConnector != nil {
 		v.OnConnector(connector)
@@ -297,9 +312,9 @@ func (v *Conductor) OnFriendRequest(t *tox.Tox, friendId string, message string,
 }
 
 func (v *Conductor) OnFriendMessage(t *tox.Tox, friendNumber uint32, message string, userData interface{}) {
-	pc, ok := v.client2pc.Load().(peerConnMap)[friendNumber]
+	pc, ok := v.client2pc[friendNumber]
 	if !ok {
-		pc, ok = v.server2pc.Load().(peerConnMap)[friendNumber]
+		pc, ok = v.server2pc[friendNumber]
 	}
 	if !ok {
 		return
@@ -308,14 +323,15 @@ func (v *Conductor) OnFriendMessage(t *tox.Tox, friendNumber uint32, message str
 }
 
 func (v *Conductor) OnFriendConnectionStatus(t *tox.Tox, friendNumber uint32, status int, userData interface{}) {
-	pc, ok := v.client2pc.Load().(peerConnMap)[friendNumber]
+	v.Log.Debug("OnFriendConnectionStatus", zap.Int("status", status))
+	pc, ok := v.client2pc[friendNumber]
 	if !ok {
-		pc, ok = v.server2pc.Load().(peerConnMap)[friendNumber]
+		pc, ok = v.server2pc[friendNumber]
 	}
 	if !ok {
 		return
 	}
 
 	on := status != tox.CONNECTION_NONE
-	pc.online.Store(on)
+	pc.online = on
 }

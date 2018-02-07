@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -44,14 +43,19 @@ type SignalingSender interface {
 
 type DataChannel struct {
 	*webrtc.DataChannel
-	done     chan struct{}
-	doneOnce sync.Once
+	rc         *RtcConnector
+	done       chan struct{}
+	doneOnce   sync.Once
+	closed     chan bool
+	closedOnce sync.Once
 }
 
-func NewDataChannel(dc *webrtc.DataChannel) *DataChannel {
+func NewDataChannel(rc *RtcConnector, dc *webrtc.DataChannel) *DataChannel {
 	return &DataChannel{
 		DataChannel: dc,
+		rc:          rc,
 		done:        make(chan struct{}),
+		closed:      make(chan bool),
 	}
 }
 
@@ -59,16 +63,33 @@ func (dc *DataChannel) Done() {
 	dc.doneOnce.Do(func() { close(dc.done) })
 }
 
+func (dc *DataChannel) Close() (err error) {
+	dc.closedOnce.Do(func() {
+		close(dc.closed)
+		err = dc.DataChannel.Close()
+	})
+	return
+}
+
+func (dc *DataChannel) CloseNotify() <-chan bool {
+	return dc.closed
+}
+
 type RtcConnector struct {
 	Local  string
 	Remote string
 
-	log      *zap.Logger
-	ss       SignalingSender
-	pc       *webrtc.PeerConnection
-	dcs      chan *DataChannel
-	pcfailed atomic.Value
-	addr     net.Addr
+	log          *zap.Logger
+	ss           SignalingSender
+	pc           *webrtc.PeerConnection
+	dcs          chan *DataChannel
+	pcfailed     chan struct{}
+	pcfailedOnce sync.Once
+	addr         net.Addr
+
+	channelsClose chan struct{}
+
+	anwser chan struct{}
 }
 
 func NewConnector(local, remote string, ss SignalingSender, log *zap.Logger) (*RtcConnector, error) {
@@ -91,13 +112,16 @@ func NewConnector(local, remote string, ss SignalingSender, log *zap.Logger) (*R
 	}
 
 	r := &RtcConnector{
-		log:    log,
-		ss:     ss,
-		pc:     pc,
-		Local:  local,
-		Remote: remote,
-		dcs:    make(chan *DataChannel),
-		addr:   newAddr(local),
+		log:      log,
+		ss:       ss,
+		pc:       pc,
+		Local:    local,
+		Remote:   remote,
+		dcs:      make(chan *DataChannel),
+		pcfailed: make(chan struct{}),
+		addr:     newAddr(local),
+
+		anwser: make(chan struct{}),
 	}
 
 	// OnNegotiationNeeded is triggered when something important has occurred in
@@ -112,19 +136,38 @@ func NewConnector(local, remote string, ss SignalingSender, log *zap.Logger) (*R
 	// A DataChannel is generated through this callback only when the remote peer
 	// has initiated the creation of the data channel.
 	pc.OnDataChannel = func(channel *webrtc.DataChannel) {
-		dc := NewDataChannel(channel)
+		dc := NewDataChannel(r, channel)
 		r.dcs <- dc
 		<-dc.done
 	}
 
-	r.pcfailed.Store(false)
 	pc.OnConnectionStateChange = func(state webrtc.PeerConnectionState) {
-		r.pcfailed.Store(state == webrtc.PeerConnectionStateFailed)
-		log.Debug("Connection state changed", zap.Stringer("state", state), zap.String("remote", remote))
+		if state == webrtc.PeerConnectionStateFailed {
+			go r.Close()
+		} else if state == webrtc.PeerConnectionStateDisconnected {
+			if r.channelsClose == nil {
+				r.channelsClose = make(chan struct{})
+				go func() {
+					select {
+					case <-time.After(6 * time.Second):
+						r.Close()
+					case <-r.channelsClose:
+					case <-r.pcfailed:
+					}
+				}()
+			}
+		} else if state == webrtc.PeerConnectionStateConnected {
+			if r.channelsClose != nil {
+				close(r.channelsClose)
+				r.channelsClose = nil
+			}
+		}
+
+		log.Debug("Connection state changed", zap.Stringer("state", state))
 	}
 
 	pc.OnSignalingStateChange = func(state webrtc.SignalingState) {
-		log.Debug("Signal state changed", zap.Stringer("state", state), zap.String("remote", remote))
+		log.Debug("Signal state changed", zap.Stringer("state", state))
 	}
 
 	return r, nil
@@ -149,7 +192,21 @@ func (r *RtcConnector) generateOffer() {
 	// send offer
 	sdp := offer.Serialize()
 	if sdp != "" {
-		r.ss.SignalingSend(append([]byte{RtcSdpTag}, []byte(sdp)...))
+		go func(msg []byte) {
+			r.ss.SignalingSend(msg)
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					r.ss.SignalingSend(msg)
+				case <-r.anwser:
+					return
+				case <-r.pcfailed:
+					return
+				}
+			}
+		}(append([]byte{RtcSdpTag}, []byte(sdp)...))
 	}
 }
 
@@ -191,6 +248,11 @@ func (r *RtcConnector) onRemoteSdp(s []byte) {
 	r.log.Debug("SDP received", zap.String("type", sdp.Type))
 	if "offer" == sdp.Type {
 		go r.generateAnswer()
+	} else {
+		select {
+		case r.anwser <- struct{}{}:
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -228,23 +290,23 @@ func (r *RtcConnector) AcceptChannel() (*DataChannel, error) {
 		select {
 		case dc := <-r.dcs:
 			return dc, nil
-		case <-time.After(2 * time.Second):
-			if r.pcfailed.Load().(bool) {
-				return nil, ErrPeerConnectionFailed
-			}
+		case <-r.pcfailed:
+			return nil, ErrPeerConnectionFailed
 		}
 	}
 }
 
-func (r *RtcConnector) CreateChannel() (*webrtc.DataChannel, error) {
+func (r *RtcConnector) CreateChannel() (*DataChannel, error) {
 	// Attempting to create the first datachannel triggers ICE.
-	r.log.Debug("Initializing datachannel", zap.String("remote", r.Remote))
-	dc, err := r.pc.CreateDataChannel(r.Remote)
+	r.log.Debug("Initializing datachannel")
+	channel, err := r.pc.CreateDataChannel("")
 	if err != nil {
-		r.log.Error("Unexpected failure creating webrtc.DataChannel", zap.Error(err), zap.String("remote", r.Remote))
+		r.log.Error("Unexpected failure creating webrtc.DataChannel", zap.Error(err))
 		return nil, err
 	}
-	r.log.Debug("Initialize datachannel ok", zap.String("remote", r.Remote))
+	r.log.Debug("Initialize datachannel ok")
+
+	dc := NewDataChannel(r, channel)
 	return dc, nil
 }
 
@@ -253,28 +315,32 @@ func (r *RtcConnector) Accept() (net.Conn, error) {
 		select {
 		case dc := <-r.dcs:
 			return NewConn(dc, r.Local, r.Remote, r.log), nil
-		case <-time.After(2 * time.Second):
-			if r.pcfailed.Load().(bool) {
-				return nil, ErrPeerConnectionFailed
-			}
+		case <-r.pcfailed:
+			return nil, ErrPeerConnectionFailed
 		}
 	}
 }
 
 func (r *RtcConnector) Dial() (net.Conn, error) {
-	channel, err := r.CreateChannel()
+	dc, err := r.CreateChannel()
 	if err != nil {
 		return nil, err
 	}
-	dc := NewDataChannel(channel)
 	return NewConn(dc, r.Local, r.Remote, r.log), nil
 }
 
-func (r *RtcConnector) Close() error {
-	r.pcfailed.Store(true)
-	return r.pc.Close()
+func (r *RtcConnector) Close() (err error) {
+	r.pcfailedOnce.Do(func() {
+		close(r.pcfailed)
+		err = r.pc.Close()
+	})
+	return
 }
 
 func (r *RtcConnector) Addr() net.Addr {
 	return r.addr
+}
+
+func (r *RtcConnector) CloseNotify() <-chan struct{} {
+	return r.pcfailed
 }

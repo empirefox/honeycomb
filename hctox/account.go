@@ -1,11 +1,10 @@
 package hctox
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"io"
-	"math/rand"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/crypto/curve25519"
 )
@@ -28,7 +27,7 @@ func NewAccount(secret string, nospam uint32) (*Account, error) {
 	}, nil
 }
 
-func GenerateAccount(randReader io.Reader) (*Account, error) {
+func GenerateAccount(randReader io.Reader, nospam uint32) (*Account, error) {
 	var scalar [32]byte
 	if _, err := io.ReadFull(randReader, scalar[:]); err != nil {
 		return nil, err
@@ -36,7 +35,7 @@ func GenerateAccount(randReader io.Reader) (*Account, error) {
 
 	a := Account{
 		Secret: strings.ToUpper(hex.EncodeToString(scalar[:])),
-		Nospam: rand.Uint32(),
+		Nospam: nospam,
 	}
 	toxid := toxID(&scalar, a.Nospam)
 	a.ToxID = strings.ToUpper(hex.EncodeToString(toxid))
@@ -66,8 +65,7 @@ func toxID(secret *[32]byte, nospam uint32) (toxid []byte) {
 	curve25519.ScalarBaseMult(&public, secret)
 	copy(toxid[:32], public[:])
 
-	b := (*[4]byte)(unsafe.Pointer(&nospam))
-	toxid[32], toxid[33], toxid[34], toxid[35] = b[3], b[2], b[1], b[0]
+	binary.BigEndian.PutUint32(toxid[32:], nospam)
 
 	checksum := toxid[36:]
 	for i := 0; i < 36; i++ {

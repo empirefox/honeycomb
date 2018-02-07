@@ -2,13 +2,14 @@ package hcrtc
 
 import (
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/keroserene/go-webrtc"
+
+	"go.uber.org/zap"
 )
 
 var (
@@ -17,7 +18,7 @@ var (
 )
 
 type Conn struct {
-	*webrtc.DataChannel
+	*DataChannel
 	log          *zap.Logger
 	localAddr    *addr
 	remoteAddr   *addr
@@ -28,7 +29,7 @@ type Conn struct {
 
 func NewConn(dc *DataChannel, local, remote string, log *zap.Logger) *Conn {
 	c := &Conn{
-		DataChannel: dc.DataChannel,
+		DataChannel: dc,
 		log:         log,
 		localAddr:   newAddr(local),
 		remoteAddr:  newAddr(remote),
@@ -37,24 +38,32 @@ func NewConn(dc *DataChannel, local, remote string, log *zap.Logger) *Conn {
 
 	var once sync.Once
 
-	opened := make(chan struct{})
+	ok := make(chan struct{})
 	// not fired when OnDataChannel
 	c.OnOpen = func() {
-		c.log.Debug("channel.OnOpen", zap.String("remote", remote))
-		once.Do(func() { close(opened) })
+		c.log.Debug("channel.OnOpen")
+		once.Do(func() { close(ok) })
 	}
 
 	// TODO not fired when remote disconnect
 	c.OnClose = func() {
-		c.log.Debug("channel.OnClose", zap.String("remote", remote))
+		c.log.Debug("channel.OnClose")
+		go c.Close()
 	}
 
 	c.OnMessage = func(b []byte) {
+		select {
+		case <-c.DataChannel.closed:
+			return
+		default:
+		}
 		c.recvQueue <- b
 	}
 
 	dc.Done()
-	<-opened
+	if c.ReadyState() != webrtc.DataStateOpen {
+		<-ok
+	}
 	return c
 }
 
@@ -84,10 +93,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 	}
 
 	select {
-	case m, ok := <-c.recvQueue:
-		if !ok {
-			return 0, ErrChannelClose
-		}
+	case m := <-c.recvQueue:
 		lm := len(m)
 		if lm > size {
 			copy(b, m[:size])
@@ -97,14 +103,19 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 			copy(b, m)
 			return lm, nil
 		}
+	case <-c.DataChannel.closed:
+		return 0, io.ErrUnexpectedEOF
 	case <-timeout:
 		return 0, ErrReadTimeout
 	}
 }
 
+// Write do not use io.Copy since b may be used in another thread.
 func (c *Conn) Write(b []byte) (n int, err error) {
-	if c.ReadyState() != webrtc.DataStateOpen {
+	select {
+	case <-c.DataChannel.closed:
 		return 0, ErrChannelClose
+	default:
 	}
 	c.Send(b)
 	return len(b), nil
@@ -113,14 +124,31 @@ func (c *Conn) Write(b []byte) (n int, err error) {
 func (c *Conn) LocalAddr() net.Addr  { return c.localAddr }
 func (c *Conn) RemoteAddr() net.Addr { return c.remoteAddr }
 func (c *Conn) SetDeadline(t time.Time) error {
+	select {
+	case <-c.DataChannel.closed:
+		return ErrChannelClose
+	default:
+	}
 	c.readDeadline = t
 	return nil
 }
 func (c *Conn) SetReadDeadline(t time.Time) error {
+	select {
+	case <-c.DataChannel.closed:
+		return ErrChannelClose
+	default:
+	}
 	c.readDeadline = t
 	return nil
 }
-func (c *Conn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	select {
+	case <-c.DataChannel.closed:
+		return ErrChannelClose
+	default:
+	}
+	return nil
+}
 
 type addr struct {
 	label string
